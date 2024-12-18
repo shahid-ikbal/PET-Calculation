@@ -1,0 +1,149 @@
+// Load Pakistan boundary
+var pakistan = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+                 .filter(ee.Filter.eq('country_na', 'Pakistan'));
+
+// Load ERA5 daily data (for temperature, wind speed, surface pressure, etc.)
+var era5 = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
+            .select(['temperature_2m_max', 'temperature_2m_min', 
+                     'dewpoint_temperature_2m', // Corrected dewpoint temperature band
+                     'surface_solar_radiation_downwards_sum', 'surface_pressure', 
+                     'u_component_of_wind_10m', 'v_component_of_wind_10m'])
+            .filterDate('2023-01-01', '2023-12-31');
+
+// Constants for Penman-Monteith equation
+var G = ee.Image.constant(0); // Soil heat flux density (assumed zero)
+var alpha = ee.Image.constant(0.23); // Albedo
+var Cp = ee.Image.constant(1013); // Specific heat of air (J/kg/°C)
+var epsilon = ee.Image.constant(0.622); // Ratio of molecular weight of water vapor to dry air
+
+// Function to calculate PET using FAO Penman-Monteith method
+var calculatePET_PM = function(image) {
+  var tmax = image.select('temperature_2m_max').subtract(273.15); // Max temp in °C
+  var tmin = image.select('temperature_2m_min').subtract(273.15); // Min temp in °C
+  var tmean = tmax.add(tmin).divide(2); // Mean temp in °C
+  
+  // Use the correct dewpoint temperature band (in °C)
+  var tdmean = image.select('dewpoint_temperature_2m').subtract(273.15); 
+  
+  // Saturation vapor pressure (in kPa)
+  var es = tmean.expression(
+    '0.6108 * exp((17.27 * T) / (T + 237.3))', {
+      'T': tmean
+    }
+  );
+  
+  // Actual vapor pressure from dewpoint temperature (in kPa)
+  var ea = tdmean.expression(
+    '0.6108 * exp((17.27 * Td) / (Td + 237.3))', {
+      'Td': tdmean
+    }
+  );
+  
+  // Wind speed (u and v components)
+  var u2 = image.select('u_component_of_wind_10m');
+  var v2 = image.select('v_component_of_wind_10m');
+  var wind = u2.pow(2).add(v2.pow(2)).sqrt(); // Wind speed in m/s
+  
+  // Surface pressure (Pa)
+  var pressure = image.select('surface_pressure').divide(1000); // Convert Pa to kPa
+  
+  // Net radiation (MJ/m²/day) – from solar radiation and adjusted for albedo
+  var Rs = image.select('surface_solar_radiation_downwards_sum').divide(1000000); // From J/m² to MJ/m²
+  var Rns = Rs.multiply(ee.Image.constant(1).subtract(alpha)); // Net shortwave radiation
+  
+  // Longwave radiation calculation (simplified for clarity)
+  var Rnl = ee.Image(4.903e-9)
+              .multiply(tmean.pow(4))
+              .multiply(ee.Image.constant(0.34).subtract(ee.Image.constant(0.14).multiply(ea.sqrt())))
+              .multiply(ee.Image.constant(1.35).multiply(Rs.divide(ee.Image.constant(0.8))).subtract(ee.Image.constant(0.35)));
+  
+  // Net radiation (MJ/m²/day)
+  var Rn = Rns.subtract(Rnl); 
+  
+  // Penman-Monteith PET formula (mm/day)
+  var delta = tmean.expression(
+    '4098 * (0.6108 * exp((17.27 * T) / (T + 237.3))) / pow(T + 237.3, 2)', {
+      'T': tmean
+    }
+  );
+  
+  // Psychrometric constant (γ)
+  var gamma = Cp.multiply(pressure).divide(epsilon.multiply(2.45)); 
+  
+  // Penman-Monteith equation for PET
+  var PET = delta.multiply(Rn.subtract(G))
+                .add(gamma.multiply(900).divide(tmean.add(273)).multiply(wind).multiply(es.subtract(ea)))
+                .divide(delta.add(gamma.multiply(1).add(gamma.multiply(0.34).multiply(wind))));
+  
+  return PET.rename('PET').set('system:time_start', image.get('system:time_start'));
+};
+
+// Apply PET calculation for each day
+var petCollection = era5.map(calculatePET_PM);
+
+// Compute annual mean PET for visualization
+var annualPET = petCollection.mean().clip(pakistan);
+
+// Visualization parameters - Adjusted range for PET
+var petVis = {
+  min: 0,
+  max: 8,  // Adjusted to show variability (0 to 8 mm/day)
+  palette: ['blue', 'cyan', 'green', 'yellow', 'orange', 'red']
+};
+
+// Add PET layer to map
+Map.addLayer(annualPET, petVis, 'Annual PET');
+
+// Center the map on Pakistan
+Map.centerObject(pakistan, 6);
+
+// Create a legend for the PET values
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px'
+  }
+});
+
+var legendTitle = ui.Label({
+  value: 'Potential Evapotranspiration (mm/day)',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '18px',
+    margin: '0 0 4px 0',
+    padding: '0'
+  }
+});
+
+legend.add(legendTitle);
+
+var makeColorBar = function(palette) {
+  var colorBar = ui.Thumbnail({
+    image: ee.Image.pixelLonLat().select(0),
+    params: {
+      bbox: [0, 0, 1, 0.1],
+      dimensions: '100x10',
+      format: 'png',
+      min: 0,
+      max: 1,
+      palette: palette
+    },
+    style: {stretch: 'horizontal', margin: '0px 8px'}
+  });
+  return colorBar;
+};
+
+legend.add(makeColorBar(petVis.palette));
+
+var labels = ui.Panel({
+  widgets: [
+    ui.Label(petVis.min, {margin: '4px 8px'}),
+    ui.Label((petVis.max / 2).toFixed(1), {margin: '4px 8px', textAlign: 'center', stretch: 'horizontal'}),
+    ui.Label(petVis.max, {margin: '4px 8px'})
+  ],
+  layout: ui.Panel.Layout.flow('horizontal')
+});
+
+legend.add(labels);
+
+Map.add(legend);
